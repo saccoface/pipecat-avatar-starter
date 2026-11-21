@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Avatar Host</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 16px; display: flex; justify-content: center; }
+  main { width: min(480px, 100%); display: grid; gap: 12px; }
+  #avatar { width: 100%; aspect-ratio: 3 / 4; border-radius: 12px; background: #1b1d22; overflow: hidden; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; padding: 6px 14px; }
+  #status { opacity: 0.75; }
+  #log { font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; max-height: 14em; overflow: auto; margin: 0; opacity: 0.85; }
+</style>
+</head>
+<body>
+<main>
+  <h1 style="margin:0;font-size:20px">Avatar Host</h1>
+  <p style="margin:0;opacity:.75">Headphones on. Press Start and the host will interview you. Answer out loud.</p>
+  <div id="avatar"></div>
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <span id="status" aria-live="polite"></span>
+  </div>
+  <pre id="log"></pre>
+</main>
+
+<script type="module">
+// The Pipecat bot (bot.py) with the SpatialReal avatar in the browser. Adapted from SpatialReal's
+// example page (github.com/SpatialReal-ai/pipecat-spatialreal, Apache-2.0) to use Pipecat's own
+// peer-to-peer WebRTC, so no Daily or LiveKit account is needed. pipecat-client-js carries the
+// microphone, the bot's audio track and the bot's RTVI messages; the SpatialReal web SDK draws the
+// avatar and plays the bot's voice in step with it.
+import { PipecatClient } from 'https://esm.sh/@pipecat-ai/client-js@1.16.0'
+import { SmallWebRTCTransport } from 'https://esm.sh/@pipecat-ai/small-webrtc-transport@1.11.2?deps=@pipecat-ai/client-js@1.16.0'
+
+const $ = id => document.getElementById(id)
+
+// How long Start waits for each step before it gives up and says so. A bot that fails while it
+// starts (a missing key, say) never becomes ready, and its terminal says why.
+const REQUEST_TIMEOUT_MS = 15000
+const READY_TIMEOUT_MS = 30000
+
+// Peer-to-peer WebRTC has exactly two ends: you and the bot. So every remote audio track is the
+// bot's, and only that track goes to the SDK.
+
+const say = text => {
+  $('status').textContent = text
+  $('log').textContent += `${new Date().toTimeString().slice(0, 8)}  ${text}\n`
+  $('log').scrollTop = $('log').scrollHeight
+}
+
+// The SpatialReal web SDK (npm @spatialreal/web-sdk; 1.0.0-beta.6 is the first with the Pipecat
+// session), from a CDN so this page needs no build step. An app installs it and imports it through
+// its bundler instead.
+let sdk = null
+try {
+  sdk = await import('https://cdn.jsdelivr.net/npm/@spatialreal/web-sdk@1.0.0-beta.8/dist/index.js')
+} catch (e) {
+  $('start').disabled = true
+  say(`the SpatialReal web SDK could not be loaded (${e.message})`)
+}
+
+// The run that Start began and Stop ends: what it has made so far, and the signal Stop aborts.
+let run = null
+
+/** Wait for `promise`, but no longer than `ms` (then fail with `late`), and not past Stop. */
+function within(promise, ms, signal, late) {
+  let timer, onStop
+  const bounds = new Promise((_, reject) => {
+    if (signal.aborted) return reject(signal.reason)
+    timer = setTimeout(() => reject(new Error(late)), ms)
+    onStop = () => reject(signal.reason)
+    signal.addEventListener('abort', onStop, { once: true })
+  })
+  return Promise.race([promise, bounds]).finally(() => {
+    clearTimeout(timer)
+    signal.removeEventListener('abort', onStop)
+  })
+}
+
+async function request(path, init, signal) {
+  const response = await within(fetch(path, { ...init, signal }), REQUEST_TIMEOUT_MS, signal,
+    `${path} did not answer within ${REQUEST_TIMEOUT_MS / 1000} s`)
+  if (!response.ok) {
+    const detail = await response.json().then(body => body.detail, () => '')
+    throw new Error(`${path} answered ${response.status}${detail ? `: ${detail}` : ''}`)
+  }
+  return response.json()
+}
+
+$('start').onclick = async () => {
+  const current = { stop: new AbortController(), client: null, session: null, audioContext: null }
+  const { signal } = current.stop
+  run = current
+  $('start').disabled = true
+  $('stop').disabled = false // Stop works while the bot starts, too
+  try {
+    // Inside the click, before any await: the browser lets this context play. session.start()
+    // runs after the requests below, which is too late for some browsers to unlock audio.
+    current.audioContext = sdk.createUnlockedAudioContext()
+
+    // 1. The browser gets a session token from our own backend; the API key never leaves it.
+    say('getting a session token')
+    const { session_token, avatar_id, app_id } = await request('/spatialreal-token', {}, signal)
+
+    // 2. The avatar session loads the avatar into #avatar.
+    const sr = new sdk.SpatialReal({ appId: app_id })
+    const session = current.session = await sr.createSession({
+      avatarId: avatar_id, credential: session_token, container: $('avatar'), pipecat: {}, audioContext: current.audioContext, signal,
+    })
+    session.on('turn', e => say(`turn ${e.phase} ${e.turnId.slice(0, 8)}`))
+    session.on('degraded', e => say(`avatar degraded to plain audio: ${e.reason}${e.turnId ? ` (turn ${e.turnId.slice(0, 8)})` : ''}`))
+    session.on('error', e => say(`avatar error: ${e.error.message}`))
+    await session.start() // starts playback; opens no connection of its own
+    signal.throwIfAborted()
+
+    // 3. The bot, over Pipecat's own client. Connecting posts a WebRTC offer to the runner, which
+    //    starts a fresh bot for this tab.
+    say('starting the bot')
+    const transport = new SmallWebRTCTransport()
+    const client = current.client = new PipecatClient({
+      transport,
+      enableMic: true,
+      callbacks: {
+        // The SDK plays the bot's voice itself, lined up with the face. Hand it the bot's track and
+        // never attach the track to an <audio> element (nor use PipecatClientAudio): a second
+        // player would double the voice.
+        onTrackStarted: (track, participant) => {
+          if (track.kind === 'audio' && !participant?.local) current.session?.setBotAudioTrack(track)
+        },
+        // Every RTVI server message goes to the SDK; it takes the avatar's and ignores the rest.
+        onServerMessage: data => current.session?.handleServerMessage(data),
+        onBotReady: () => say('the host is here: say hi'),
+        onUserTranscript: data => { if (data?.final) say(`you: ${data.text}`) },
+        // The bot left, or the connection dropped. When Stop disconnects, the run is over already.
+        onDisconnected: () => { if (run === current) { say('disconnected'); stop() } },
+        onError: message => say(`bot error: ${JSON.stringify(message?.data ?? message)}`),
+      },
+    })
+    say('waiting for the bot')
+    await within(client.connect({ webrtcRequestParams: { endpoint: '/api/offer' } }), READY_TIMEOUT_MS, signal,
+      `the bot was not ready within ${READY_TIMEOUT_MS / 1000} s; the bot's terminal says why`)
+  } catch (e) {
+    if (signal.aborted) return release(current) // Stop ended the run and said so
+    say(`failed: ${e.message || e}`)
+    await stop()
+  }
+}
+
+/** Let go of what a run has made. Each piece is let go once, whoever asks first. */
+async function release(r) {
+  const [c, s, a] = [r.client, r.session, r.audioContext]
+  r.client = r.session = r.audioContext = null
+  if (c) await c.disconnect().catch(() => {}) // the bot sees its client leave and ends the session
+  if (s) await s.dispose().catch(() => {})
+  if (a) await a.close().catch(() => {}) // the SDK plays through it but never closes it; browsers cap live contexts
+}
+
+/** End the run, at any point of it: what is still starting gives up, and what is made is let go. */
+async function stop() {
+  const r = run
+  run = null
+  if (r) {
+    r.stop.abort(new Error('stopped'))
+    await release(r)
+  }
+  $('start').disabled = !sdk
+  $('stop').disabled = true
+}
+$('stop').onclick = async () => { await stop(); say('stopped') }
+</script>
+</body>
+</html>

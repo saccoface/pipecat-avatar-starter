@@ -1,0 +1,13 @@
+[project]
+name = "pipecat-avatar-starter"
+version = "0.1.0"
+description = "Avatar Host: a Pipecat voice bot with a SpatialReal avatar, Deepgram Flux and Claude"
+requires-python = ">=3.11"
+dependencies = [
+    "pipecat-ai[deepgram,anthropic,webrtc,runner]>=1.16,<2",
+    "pipecat-spatialreal==0.2.1",
+    "python-dotenv",
+]
+
+[tool.uv]
+package = false
